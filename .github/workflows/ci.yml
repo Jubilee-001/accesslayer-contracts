@@ -17,7 +17,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           components: rustfmt, clippy
 
       - name: Rust versions
@@ -33,3 +33,6 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Invariant test coverage check
+        run: python3 scripts/check_invariants_tested.py
