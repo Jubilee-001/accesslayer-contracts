@@ -5,6 +5,8 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Val, Vec,
 };
 
+pub const TIMELOCK_SECS: u64 = 86_400;
+
 /// Maximum signer count keeps vote counting and configuration updates bounded.
 pub const MAX_SIGNERS: u32 = 20;
 
@@ -65,6 +67,7 @@ enum DataKey {
     Proposal(u32),
     Approval(u32, Address),
     Rejection(u32, Address),
+    Pending,
 }
 
 #[contracterror]
@@ -81,6 +84,8 @@ pub enum MultisigError {
     ThresholdNotReached = 8,
     AlreadyExecuted = 9,
     InvalidAction = 10,
+    TimelockActive = 11,
+    NoPendingUpdate = 12,
 }
 
 #[contract]
@@ -98,6 +103,12 @@ fn read_threshold(env: &Env) -> Result<u32, MultisigError> {
         .instance()
         .get(&DataKey::Threshold)
         .ok_or(MultisigError::NotInitialized)
+}
+
+fn pending(env: &Env) -> Result<(Address, u32, u64), MultisigError> {
+    let s = env.storage().instance();
+    s.get(&DataKey::Pending)
+        .ok_or(MultisigError::NoPendingUpdate)
 }
 
 fn is_signer(signers: &Vec<Address>, candidate: &Address) -> bool {
@@ -211,12 +222,17 @@ impl MultisigAdminContract {
         env.storage()
             .instance()
             .set(&DataKey::NextProposalId, &next_id);
-        emit_action_event(&env, Symbol::new(&env, "proposed"), proposal_id, &proposer);
+        emit_action_event(
+            &env,
+            Symbol::new(&env, "ActionProposed"),
+            proposal_id,
+            &proposer,
+        );
         Ok(proposal_id)
     }
 
     /// Records one approval per authorized signer.
-    pub fn sign_proposal(env: Env, signer: Address, proposal_id: u32) -> Result<(), MultisigError> {
+    pub fn sign_action(env: Env, signer: Address, proposal_id: u32) -> Result<(), MultisigError> {
         signer.require_auth();
         let mut proposal = load_proposal(&env, proposal_id)?;
         assert_signer(&proposal.signers, &signer)?;
@@ -243,7 +259,12 @@ impl MultisigAdminContract {
             .checked_add(1)
             .ok_or(MultisigError::InvalidAction)?;
         save_proposal(&env, &proposal);
-        emit_action_event(&env, Symbol::new(&env, "signed"), proposal_id, &signer);
+        emit_action_event(
+            &env,
+            Symbol::new(&env, "ActionSigned"),
+            proposal_id,
+            &signer,
+        );
         Ok(())
     }
 
@@ -283,7 +304,7 @@ impl MultisigAdminContract {
     /// Executes an approved proposal. Call proposals invoke the target as this
     /// contract, allowing targets to require authorization from the multisig.
     /// Execution is permissionless; `executor` is authenticated for auditability.
-    pub fn execute_proposal(
+    pub fn execute_action(
         env: Env,
         executor: Address,
         proposal_id: u32,
@@ -330,7 +351,12 @@ impl MultisigAdminContract {
 
         proposal.executed = true;
         save_proposal(&env, &proposal);
-        emit_action_event(&env, Symbol::new(&env, "executed"), proposal_id, &executor);
+        emit_action_event(
+            &env,
+            Symbol::new(&env, "ActionExecuted"),
+            proposal_id,
+            &executor,
+        );
         Ok(())
     }
 
@@ -340,6 +366,50 @@ impl MultisigAdminContract {
 
     pub fn get_signers(env: Env) -> Result<Vec<Address>, MultisigError> {
         read_signers(&env)
+    }
+
+    pub fn propose_threshold_update(env: Env, who: Address, new: u32) -> Result<(), MultisigError> {
+        who.require_auth();
+        let signers = read_signers(&env)?;
+        assert_signer(&signers, &who)?;
+        validate_signers(&signers, new)?;
+        let eta = env.ledger().timestamp() + TIMELOCK_SECS;
+        env.storage()
+            .instance()
+            .set(&DataKey::Pending, &(who.clone(), new, eta));
+        env.events().publish(
+            (Symbol::new(&env, "ThresholdUpdateProposed"), who),
+            (new, eta),
+        );
+        Ok(())
+    }
+
+    pub fn execute_threshold_update(env: Env, who: Address) -> Result<(), MultisigError> {
+        who.require_auth();
+        assert_signer(&read_signers(&env)?, &who)?;
+        let (_, new, eta) = pending(&env)?;
+        if env.ledger().timestamp() < eta {
+            return Err(MultisigError::TimelockActive);
+        }
+        let s = env.storage().instance();
+        s.remove(&DataKey::Pending);
+        s.set(&DataKey::Threshold, &new);
+        env.events()
+            .publish((Symbol::new(&env, "ThresholdUpdateExecuted"), who), new);
+        Ok(())
+    }
+
+    pub fn cancel_threshold_update(env: Env, who: Address) -> Result<(), MultisigError> {
+        who.require_auth();
+        if pending(&env)?.0 != who {
+            return Err(MultisigError::Unauthorized);
+        }
+        env.storage().instance().remove(&DataKey::Pending);
+        Ok(())
+    }
+
+    pub fn get_pending_threshold_update(env: Env) -> Result<(u32, u64), MultisigError> {
+        pending(&env).map(|(_, t, eta)| (t, eta))
     }
 
     pub fn get_threshold(env: Env) -> Result<u32, MultisigError> {
